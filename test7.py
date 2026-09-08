@@ -1,8 +1,8 @@
 import sys
 import logging
 from pyspark.context import SparkContext
-from pyspark.sql.expressions import Window
-from pyspark.sql.functions import col, row_number, lead, round as spark_round
+from pyspark.sql.window import Window
+from pyspark.sql.functions import col, coalesce, row_number, lead, round as spark_round
 from awsglue.context import GlueContext
 from awsglue.job import Job
 from awsglue.utils import getResolvedOptions
@@ -32,14 +32,20 @@ telemetry_df = spark.createDataFrame(telemetry_records, columns)
 
 logger.info("Computing telemetry delta metrics between successive pings...")
 
-# FAILS HERE: Window definition omits orderBy, required by row_number and lead
-vehicle_window = Window.partitionBy("vehicle_id")
+# Fixed: added .orderBy("event_timestamp") so that row_number() and lead() produce
+# deterministic, chronologically-ordered results within each vehicle partition.
+vehicle_window = Window.partitionBy("vehicle_id").orderBy("event_timestamp")
 
 enriched_df = telemetry_df.withColumn("ping_seq", row_number().over(vehicle_window)) \
                           .withColumn("next_speed", lead("speed_kph", 1).over(vehicle_window))
 
 logger.info("Calculating instantaneous acceleration indices...")
-metrics_df = enriched_df.withColumn("speed_delta", spark_round(col("next_speed") - col("speed_kph"), 2))
+# Fixed: wrapped next_speed with coalesce so that the last ping per vehicle
+# (where lead returns null) produces a speed_delta of 0.0 instead of null.
+metrics_df = enriched_df.withColumn(
+    "speed_delta",
+    spark_round(coalesce(col("next_speed"), col("speed_kph")) - col("speed_kph"), 2)
+)
 
 metrics_df.show()
 job.commit()
