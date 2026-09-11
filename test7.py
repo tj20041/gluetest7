@@ -1,8 +1,8 @@
 import sys
 import logging
 from pyspark.context import SparkContext
-from pyspark.sql.expressions import Window
-from pyspark.sql.functions import col, row_number, lead, round as spark_round
+from pyspark.sql.window import Window
+from pyspark.sql.functions import col, row_number, lead, round as spark_round, to_timestamp
 from awsglue.context import GlueContext
 from awsglue.job import Job
 from awsglue.utils import getResolvedOptions
@@ -30,16 +30,37 @@ telemetry_records = [
 columns = ["vehicle_id", "event_timestamp", "speed_kph", "longitude", "latitude"]
 telemetry_df = spark.createDataFrame(telemetry_records, columns)
 
+logger.info("Casting event_timestamp string column to TimestampType for deterministic ordering...")
+
+# Cast the raw string timestamp to a proper TimestampType so that window ordering is
+# chronologically correct instead of relying on lexical string ordering.
+telemetry_df = telemetry_df.withColumn(
+    "event_timestamp",
+    to_timestamp(col("event_timestamp"), "yyyy-MM-dd HH:mm:ss")
+)
+
 logger.info("Computing telemetry delta metrics between successive pings...")
 
-# FAILS HERE: Window definition omits orderBy, required by row_number and lead
-vehicle_window = Window.partitionBy("vehicle_id")
+# FIXED: Window definition now includes orderBy('event_timestamp'), which is required
+# by row_number() and lead() to produce deterministic, chronologically ordered results.
+vehicle_window = Window.partitionBy("vehicle_id").orderBy("event_timestamp")
 
-enriched_df = telemetry_df.withColumn("ping_seq", row_number().over(vehicle_window)) \
-                          .withColumn("next_speed", lead("speed_kph", 1).over(vehicle_window))
+try:
+    enriched_df = telemetry_df.withColumn("ping_seq", row_number().over(vehicle_window)) \
+                              .withColumn("next_speed", lead("speed_kph", 1).over(vehicle_window))
 
-logger.info("Calculating instantaneous acceleration indices...")
-metrics_df = enriched_df.withColumn("speed_delta", spark_round(col("next_speed") - col("speed_kph"), 2))
+    logger.info("Calculating instantaneous acceleration indices...")
+    metrics_df = enriched_df.withColumn(
+        "speed_delta", spark_round(col("next_speed") - col("speed_kph"), 2)
+    )
 
-metrics_df.show()
-job.commit()
+    metrics_df.show()
+    job.commit()
+except Exception as e:
+    logger.error("Failed while computing telemetry window metrics. Dumping schemas for diagnostics.")
+    try:
+        logger.error("telemetry_df schema:")
+        telemetry_df.printSchema()
+    except Exception:
+        logger.error("Unable to print telemetry_df schema.")
+    raise e
